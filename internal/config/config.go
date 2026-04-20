@@ -37,7 +37,7 @@ func Load() (Config, error) {
 		openAIResponsesPath = "/responses"
 	}
 	defaultModel := getenv("DEFAULT_CODEX_MODEL", "gpt-5.3-codex")
-	defaultHaikuModel := getenv("HAIKU_MODEL", defaultModel)
+	defaultHaikuModel := getenv("HAIKU_MODEL", "gpt-5.1-codex-mini")
 
 	cfg := Config{
 		Port:                getenv("PORT", "8083"),

@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -216,46 +215,10 @@ func (c *Client) debugLogJSON(prefix string, payload []byte) {
 	if !c.debugJSON {
 		return
 	}
-	c.debugWriteResponseJSON(prefix, payload)
 	maxLen := c.debugMaxLen
 	out := string(payload)
 	if maxLen > 0 && len(out) > maxLen {
 		out = out[:maxLen] + "...(truncated)"
 	}
 	log.Printf("[debug-json] %s: %s", prefix, out)
-}
-
-func (c *Client) debugWriteResponseJSON(prefix string, payload []byte) {
-	target := ""
-	switch {
-	case strings.HasPrefix(prefix, "upstream.response"):
-		target = "response.json"
-	case strings.HasPrefix(prefix, "upstream.stream.response"):
-		target = "response.json"
-	case strings.HasPrefix(prefix, "upstream.stream.event"):
-		var event struct {
-			Type string          `json:"type"`
-			Raw  json.RawMessage `json:"response"`
-		}
-		if err := json.Unmarshal(payload, &event); err != nil {
-			return
-		}
-		if event.Type != "response.completed" || len(event.Raw) == 0 {
-			return
-		}
-		target = "response.json"
-	default:
-		return
-	}
-
-	pretty := payload
-	var asJSON any
-	if err := json.Unmarshal(payload, &asJSON); err == nil {
-		if b, err := json.MarshalIndent(asJSON, "", "  "); err == nil {
-			pretty = append(b, '\n')
-		}
-	}
-	if err := os.WriteFile(target, pretty, 0o644); err != nil {
-		log.Printf("[debug-json] failed to write %s: %v", target, err)
-	}
 }
