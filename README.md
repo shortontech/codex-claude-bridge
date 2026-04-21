@@ -72,7 +72,7 @@ Notes:
 - If prompt fetch fails, the bridge falls back to cached prompt content (if present), then to `You are a helpful assistant.`.
 - Claude harness-specific system lines (billing header/title-generation boilerplate) are stripped before upstream forwarding.
 - The bridge composes outbound instructions from a custom base prompt plus memory tails starting at `# auto memory`.
-- `CLAUDE.md` is loaded from the project directory (derived from inbound `Primary working directory:`) plus `~/.claude/CLAUDE.md`, cached in-memory per session key (`cch` + project dir), and only the section from `# auto memory` onward is included.
+- `CLAUDE.md` is loaded from the project directory (derived from inbound `Primary working directory:`) plus `~/.claude/CLAUDE.md`, cached in-memory per project directory (stable across rotating `cch` values), and only the section from `# auto memory` onward is included.
 - Project memory is also loaded from `~/.claude/projects/<encoded-project-path>/memory/MEMORY.md`, where `<encoded-project-path>` is the primary working directory with `/` replaced by `-` (example: `/home/shorton/Documents/claude-code-proxy` -> `-home-shorton-Documents-claude-code-proxy`).
 - The bridge logs cache invariants to stderr as `[cache] ... cached_tokens=...` for both streaming and non-streaming responses.
 - `DEBUG_JSONL_PATH` writes JSONL logs even when `DEBUG_JSON=false`.

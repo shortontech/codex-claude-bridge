@@ -32,6 +32,7 @@ type Client struct {
 	sessionMu       sync.RWMutex
 	sessionCtx      map[string]string
 	projectDirByCCH map[string]string
+	lastProjectDir  string
 }
 
 const localContextHeader = "# Local bridge context"
@@ -272,14 +273,11 @@ func (c *Client) getSessionLocalContext(rawSystem string) string {
 }
 
 func extractSessionKey(rawSystem, projectDir string) string {
-	if m := cchRegex.FindStringSubmatch(rawSystem); len(m) == 2 {
-		if strings.TrimSpace(projectDir) != "" {
-			return "cch:" + m[1] + "|pwd:" + projectDir
-		}
-		return "cch:" + m[1]
-	}
 	if strings.TrimSpace(projectDir) != "" {
-		return "pwd:" + projectDir
+		return "project:" + projectDir
+	}
+	if m := cchRegex.FindStringSubmatch(rawSystem); len(m) == 2 {
+		return "cch:" + m[1]
 	}
 	return "default"
 }
@@ -297,11 +295,12 @@ func (c *Client) resolveProjectDir(rawSystem string) string {
 	cch := extractCCH(rawSystem)
 
 	if strings.TrimSpace(projectDir) != "" {
+		c.sessionMu.Lock()
+		c.lastProjectDir = projectDir
 		if cch != "" {
-			c.sessionMu.Lock()
 			c.projectDirByCCH[cch] = projectDir
-			c.sessionMu.Unlock()
 		}
+		c.sessionMu.Unlock()
 		return projectDir
 	}
 
@@ -312,6 +311,17 @@ func (c *Client) resolveProjectDir(rawSystem string) string {
 		if cached != "" {
 			return cached
 		}
+	}
+
+	c.sessionMu.RLock()
+	sticky := strings.TrimSpace(c.lastProjectDir)
+	c.sessionMu.RUnlock()
+	if sticky != "" {
+		return sticky
+	}
+
+	if cwd, err := os.Getwd(); err == nil {
+		return strings.TrimSpace(cwd)
 	}
 
 	return ""
