@@ -3,10 +3,22 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+)
+
+const (
+	defaultInstructionsFallback = "You are a helpful assistant."
+	defaultPromptCachePath      = "codex_system_prompt.txt"
+	defaultPromptURL            = "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/prompt.md"
+	maxPromptBytes              = 512 * 1024
 )
 
 type Config struct {
@@ -38,13 +50,14 @@ func Load() (Config, error) {
 	}
 	defaultModel := getenv("DEFAULT_CODEX_MODEL", "gpt-5.3-codex")
 	defaultHaikuModel := getenv("HAIKU_MODEL", "gpt-5.1-codex-mini")
+	defaultInstructions := ResolveDefaultInstructions()
 
 	cfg := Config{
 		Port:                getenv("PORT", "8083"),
 		OpenAIAPIKey:        token,
 		OpenAIBase:          openAIBase,
 		OpenAIResponsesPath: openAIResponsesPath,
-		DefaultInstructions: getenv("DEFAULT_INSTRUCTIONS", "You are a helpful assistant."),
+		DefaultInstructions: defaultInstructions,
 		DefaultModel:        defaultModel,
 		HaikuModel:          defaultHaikuModel,
 		ProxyAPIKey:         os.Getenv("PROXY_API_KEY"),
@@ -114,4 +127,128 @@ func expandHome(path string) (string, error) {
 		return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
 	}
 	return path, nil
+}
+
+func ResolveDefaultInstructions() string {
+	if manual := strings.TrimSpace(os.Getenv("DEFAULT_INSTRUCTIONS")); manual != "" {
+		return manual
+	}
+
+	promptURL := strings.TrimSpace(getenv("CODEX_SYSTEM_PROMPT_URL", defaultPromptURL))
+	if promptURL == "" {
+		return defaultInstructionsFallback
+	}
+
+	cachePath := getenv("CODEX_SYSTEM_PROMPT_CACHE", defaultPromptCachePath)
+	instructions, err := loadCachedPrompt(promptURL, cachePath)
+	if err != nil {
+		log.Printf("[prompt-cache] %v", err)
+	}
+	if strings.TrimSpace(instructions) == "" {
+		return defaultInstructionsFallback
+	}
+	return instructions
+}
+
+func loadCachedPrompt(promptURL, cachePath string) (string, error) {
+	if err := validatePromptURL(promptURL); err != nil {
+		return "", err
+	}
+
+	expanded, err := expandHome(cachePath)
+	if err != nil {
+		return "", err
+	}
+
+	var cachedModTime time.Time
+	if info, err := os.Stat(expanded); err == nil {
+		cachedModTime = info.ModTime().UTC()
+	}
+
+	fresh, notModified, fetchErr := fetchPrompt(promptURL, cachedModTime)
+	if fetchErr == nil {
+		if notModified {
+			cached, readErr := os.ReadFile(expanded)
+			if readErr != nil {
+				return "", fmt.Errorf("prompt not modified but cache unreadable: %w", readErr)
+			}
+			trimmed := strings.TrimSpace(string(cached))
+			if trimmed == "" {
+				return "", fmt.Errorf("prompt not modified but cache is empty")
+			}
+			return trimmed, nil
+		}
+		if writeErr := writePromptCache(expanded, fresh); writeErr != nil {
+			return fresh, fmt.Errorf("fetched prompt but failed writing cache at %s: %w", expanded, writeErr)
+		}
+		return fresh, nil
+	}
+
+	if cached, readErr := os.ReadFile(expanded); readErr == nil {
+		if trimmed := strings.TrimSpace(string(cached)); trimmed != "" {
+			return trimmed, nil
+		}
+	}
+
+	return "", fetchErr
+}
+
+func validatePromptURL(promptURL string) error {
+	u, err := url.ParseRequestURI(promptURL)
+	if err != nil {
+		return fmt.Errorf("invalid CODEX_SYSTEM_PROMPT_URL: %w", err)
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return fmt.Errorf("invalid CODEX_SYSTEM_PROMPT_URL scheme: %s", u.Scheme)
+	}
+	if strings.TrimSpace(u.Host) == "" {
+		return fmt.Errorf("invalid CODEX_SYSTEM_PROMPT_URL host")
+	}
+	return nil
+}
+
+func fetchPrompt(promptURL string, cacheModTime time.Time) (string, bool, error) {
+	client := http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, promptURL, nil)
+	if err != nil {
+		return "", false, err
+	}
+	if !cacheModTime.IsZero() {
+		req.Header.Set("If-Modified-Since", cacheModTime.Format(http.TimeFormat))
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified {
+		return "", true, nil
+	}
+
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return "", false, fmt.Errorf("prompt fetch failed: %s (%s)", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPromptBytes+1))
+	if err != nil {
+		return "", false, err
+	}
+	if len(body) > maxPromptBytes {
+		return "", false, fmt.Errorf("prompt fetch exceeded %d bytes", maxPromptBytes)
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return "", false, fmt.Errorf("prompt fetch returned empty body")
+	}
+	return trimmed, false, nil
+}
+
+func writePromptCache(path, value string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(value+"\n"), 0o644)
 }

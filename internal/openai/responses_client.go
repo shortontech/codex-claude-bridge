@@ -8,7 +8,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shortontech/codex-claude-bridge/internal/anthropic"
@@ -16,17 +20,35 @@ import (
 )
 
 type Client struct {
-	baseURL       string
-	responsesPath string
-	apiKey        string
-	debugJSON     bool
-	debugMaxLen   int
-	debugJSONL    string
-	defaultInstr  string
-	http          *http.Client
+	baseURL         string
+	responsesPath   string
+	apiKey          string
+	debugJSON       bool
+	debugMaxLen     int
+	debugJSONL      string
+	defaultInstr    string
+	instrResolver   func() string
+	http            *http.Client
+	sessionMu       sync.RWMutex
+	sessionCtx      map[string]string
+	projectDirByCCH map[string]string
 }
 
-func New(baseURL, responsesPath, apiKey string, debugJSON bool, debugMaxLen int, debugJSONLPath, defaultInstructions string) *Client {
+const localContextHeader = "# Local bridge context"
+const customBridgeBaseInstructions = `You are ChatGPT, running as a coding assistant in a CLI harness.
+
+Be concise, accurate, and execution-oriented.
+- Prefer calling tools directly for actions that require filesystem, git, or shell access.
+- Report concrete results from tool output; do not claim success without evidence.
+- Preserve user intent and project conventions.
+- Avoid unnecessary verbosity and avoid identity confusion with other assistants.`
+
+var cchRegex = regexp.MustCompile(`\bcch=([A-Za-z0-9_-]+)\b`)
+var claudeRepoRegex = regexp.MustCompile(`(?i)https?://github\.com/anthropics/claude-code`)
+var autoMemoryHeaderRegex = regexp.MustCompile(`(?im)^\s*#{1,6}\s*auto\s+memory\b`)
+var primaryWorkingDirRegex = regexp.MustCompile(`(?im)^\s*(?:-\s*)?Primary working directory:\s*(.+?)\s*$`)
+
+func New(baseURL, responsesPath, apiKey string, debugJSON bool, debugMaxLen int, debugJSONLPath, defaultInstructions string, instrResolver func() string) *Client {
 	path := strings.TrimSpace(responsesPath)
 	if path == "" {
 		path = "/v1/responses"
@@ -35,13 +57,16 @@ func New(baseURL, responsesPath, apiKey string, debugJSON bool, debugMaxLen int,
 		path = "/" + path
 	}
 	return &Client{
-		baseURL:       strings.TrimRight(baseURL, "/"),
-		responsesPath: path,
-		apiKey:        apiKey,
-		debugJSON:     debugJSON,
-		debugMaxLen:   debugMaxLen,
-		debugJSONL:    strings.TrimSpace(debugJSONLPath),
-		defaultInstr:  defaultInstructions,
+		baseURL:         strings.TrimRight(baseURL, "/"),
+		responsesPath:   path,
+		apiKey:          apiKey,
+		debugJSON:       debugJSON,
+		debugMaxLen:     debugMaxLen,
+		debugJSONL:      strings.TrimSpace(debugJSONLPath),
+		defaultInstr:    defaultInstructions,
+		instrResolver:   instrResolver,
+		sessionCtx:      make(map[string]string),
+		projectDirByCCH: make(map[string]string),
 		http: &http.Client{
 			Timeout: 120 * time.Second,
 		},
@@ -61,8 +86,11 @@ type responseObject struct {
 	OutputText string               `json:"output_text"`
 	Output     []responseOutputItem `json:"output"`
 	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens        int `json:"input_tokens"`
+		OutputTokens       int `json:"output_tokens"`
+		InputTokensDetails struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"input_tokens_details"`
 	} `json:"usage"`
 }
 
@@ -124,6 +152,7 @@ func (c *Client) CreateFromAnthropic(ctx context.Context, req anthropic.Messages
 	}
 
 	content, stopReason := toAnthropicBlocks(o)
+	c.logCacheUsage(model, o.Usage.InputTokens, o.Usage.InputTokensDetails.CachedTokens)
 
 	return anthropic.MessagesResponse{
 		ID:         o.ID,
@@ -139,12 +168,232 @@ func (c *Client) CreateFromAnthropic(ctx context.Context, req anthropic.Messages
 	}, nil
 }
 
-func (c *Client) resolveInstructions(req anthropic.MessagesRequest) string {
-	sys := sanitizeClaudeIdentity(req.System.Text)
-	if sys == "" {
-		sys = c.defaultInstr
+func (c *Client) logCacheUsage(model string, inputTokens, cachedTokens int) {
+	if inputTokens <= 0 {
+		return
 	}
-	return appendBridgeExecutionPolicy(normalizeInstructionText(sys), len(req.Tools) > 0)
+	if cachedTokens <= 0 {
+		log.Printf("[cache] non-caching observed model=%s input_tokens=%d cached_tokens=%d", model, inputTokens, cachedTokens)
+		return
+	}
+	log.Printf("[cache] cache-hit model=%s input_tokens=%d cached_tokens=%d", model, inputTokens, cachedTokens)
+}
+
+func (c *Client) resolveInstructions(req anthropic.MessagesRequest) string {
+	rawSystem := req.System.Text
+	parts := []string{customBridgeBaseInstructions}
+
+	if localCtx := c.getSessionLocalContext(rawSystem); localCtx != "" {
+		parts = append(parts, localCtx)
+	}
+
+	sys := strings.TrimSpace(strings.Join(parts, "\n\n"))
+	sys = scrubClaudeHarnessMentions(sys)
+	sys = appendBridgeExecutionPolicy(normalizeInstructionText(sys), len(req.Tools) > 0)
+	return sys
+}
+
+func scrubClaudeHarnessMentions(s string) string {
+	if s == "" {
+		return ""
+	}
+	out := s
+	out = claudeRepoRegex.ReplaceAllString(out, "https://github.com/openai/codex")
+	out = strings.ReplaceAll(out, "anthropics/claude-code", "openai/codex")
+	out = strings.ReplaceAll(out, "Anthropic's official CLI for Claude", "a terminal coding harness")
+	out = strings.ReplaceAll(out, "You are Claude Code", "You are ChatGPT")
+	out = strings.ReplaceAll(out, "Claude Code", "ChatGPT CLI")
+	return out
+}
+
+func looksLikeClaudeHarnessSystem(s string) bool {
+	if s == "" {
+		return false
+	}
+	lower := strings.ToLower(s)
+	return strings.Contains(lower, "x-anthropic-billing-header:") ||
+		strings.Contains(lower, "you are claude code, anthropic's official cli for claude.") ||
+		strings.Contains(lower, "generate a concise, sentence-case title")
+}
+
+func stripClaudeHarnessInstructionLines(s string) string {
+	if s == "" {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "x-anthropic-billing-header:") {
+			continue
+		}
+		if lower == "you are claude code, anthropic's official cli for claude." {
+			continue
+		}
+		if strings.Contains(lower, "generate a concise, sentence-case title") ||
+			strings.Contains(lower, "return json with a single \"title\" field") ||
+			strings.HasPrefix(lower, "good examples:") ||
+			strings.HasPrefix(lower, "bad (too vague):") ||
+			strings.HasPrefix(lower, "bad (too long):") ||
+			strings.HasPrefix(lower, "bad (wrong case):") ||
+			strings.HasPrefix(trimmed, "{\"title\":") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func (c *Client) getSessionLocalContext(rawSystem string) string {
+	projectDir := c.resolveProjectDir(rawSystem)
+	sessionKey := extractSessionKey(rawSystem, projectDir)
+
+	c.sessionMu.RLock()
+	if cached, ok := c.sessionCtx[sessionKey]; ok {
+		c.sessionMu.RUnlock()
+		return cached
+	}
+	c.sessionMu.RUnlock()
+
+	built := buildLocalContextFromFiles(projectDir)
+
+	c.sessionMu.Lock()
+	if cached, ok := c.sessionCtx[sessionKey]; ok {
+		c.sessionMu.Unlock()
+		return cached
+	}
+	c.sessionCtx[sessionKey] = built
+	c.sessionMu.Unlock()
+	if built != "" {
+		log.Printf("[instructions] loaded local context for session=%s", sessionKey)
+	}
+	return built
+}
+
+func extractSessionKey(rawSystem, projectDir string) string {
+	if m := cchRegex.FindStringSubmatch(rawSystem); len(m) == 2 {
+		if strings.TrimSpace(projectDir) != "" {
+			return "cch:" + m[1] + "|pwd:" + projectDir
+		}
+		return "cch:" + m[1]
+	}
+	if strings.TrimSpace(projectDir) != "" {
+		return "pwd:" + projectDir
+	}
+	return "default"
+}
+
+func extractCCH(rawSystem string) string {
+	m := cchRegex.FindStringSubmatch(rawSystem)
+	if len(m) != 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func (c *Client) resolveProjectDir(rawSystem string) string {
+	projectDir := extractPrimaryWorkingDirectory(rawSystem)
+	cch := extractCCH(rawSystem)
+
+	if strings.TrimSpace(projectDir) != "" {
+		if cch != "" {
+			c.sessionMu.Lock()
+			c.projectDirByCCH[cch] = projectDir
+			c.sessionMu.Unlock()
+		}
+		return projectDir
+	}
+
+	if cch != "" {
+		c.sessionMu.RLock()
+		cached := strings.TrimSpace(c.projectDirByCCH[cch])
+		c.sessionMu.RUnlock()
+		if cached != "" {
+			return cached
+		}
+	}
+
+	return ""
+}
+
+func extractPrimaryWorkingDirectory(rawSystem string) string {
+	m := primaryWorkingDirRegex.FindStringSubmatch(rawSystem)
+	if len(m) != 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+func buildLocalContextFromFiles(projectDir string) string {
+	home, _ := os.UserHomeDir()
+
+	sections := make([]string, 0, 2)
+	projectRoot := strings.TrimSpace(projectDir)
+	if projectRoot == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			projectRoot = cwd
+		}
+	}
+	if projectRoot != "" {
+		projectClaudePath := filepath.Join(projectRoot, "CLAUDE.md")
+		if b, readErr := os.ReadFile(projectClaudePath); readErr == nil {
+			if content, mode := extractAutoMemoryTailOrFull(string(b)); content != "" {
+				sections = append(sections, fmt.Sprintf("## CLAUDE.md\n%s", content))
+				log.Printf("[instructions] loaded project CLAUDE.md mode=%s path=%s", mode, projectClaudePath)
+			}
+		}
+	}
+
+	if home != "" {
+		globalClaudePath := filepath.Join(home, ".claude", "CLAUDE.md")
+		if b, readErr := os.ReadFile(globalClaudePath); readErr == nil {
+			if content, mode := extractAutoMemoryTailOrFull(string(b)); content != "" {
+				sections = append(sections, fmt.Sprintf("## .claude/CLAUDE.md\n%s", content))
+				log.Printf("[instructions] loaded global CLAUDE.md mode=%s path=%s", mode, globalClaudePath)
+			}
+		}
+
+		if projectRoot != "" {
+			encodedProjectRoot := strings.ReplaceAll(projectRoot, "/", "-")
+			projectMemoryPath := filepath.Join(home, ".claude", "projects", encodedProjectRoot, "memory", "MEMORY.md")
+			if b, readErr := os.ReadFile(projectMemoryPath); readErr == nil {
+				if content, mode := extractAutoMemoryTailOrFull(string(b)); content != "" {
+					sections = append(sections, fmt.Sprintf("## .claude/projects/%s/memory/MEMORY.md\n%s", encodedProjectRoot, content))
+					log.Printf("[instructions] loaded project MEMORY.md mode=%s path=%s", mode, projectMemoryPath)
+				}
+			}
+		}
+	}
+
+	if len(sections) == 0 {
+		return ""
+	}
+	return localContextHeader + "\n" + strings.Join(sections, "\n\n")
+}
+
+func extractAutoMemoryTail(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return ""
+	}
+	idx := autoMemoryHeaderRegex.FindStringIndex(trimmed)
+	if idx == nil {
+		return ""
+	}
+	return strings.TrimSpace(trimmed[idx[0]:])
+}
+
+func extractAutoMemoryTailOrFull(s string) (string, string) {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return "", "empty"
+	}
+	idx := autoMemoryHeaderRegex.FindStringIndex(trimmed)
+	if idx == nil {
+		return trimmed, "full"
+	}
+	return strings.TrimSpace(trimmed[idx[0]:]), "auto-memory-tail"
 }
 
 func sanitizeClaudeIdentity(s string) string {

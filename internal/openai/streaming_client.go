@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -14,10 +15,11 @@ import (
 )
 
 type StreamResult struct {
-	ResponseID string
-	Model      string
-	StopReason string
-	Usage      anthropic.Usage
+	ResponseID        string
+	Model             string
+	StopReason        string
+	Usage             anthropic.Usage
+	CachedInputTokens int
 }
 
 type streamResponseRequest struct {
@@ -30,8 +32,11 @@ type streamResponseRequest struct {
 }
 
 type openAIResponseUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens        int `json:"input_tokens"`
+	OutputTokens       int `json:"output_tokens"`
+	InputTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
 }
 
 type openAIIncompleteDetails struct {
@@ -196,9 +201,10 @@ func (c *Client) StreamFromAnthropic(
 		if event.Response.Model != "" {
 			result.Model = event.Response.Model
 		}
-		if event.Response.Usage.InputTokens > 0 || event.Response.Usage.OutputTokens > 0 {
+		if event.Response.Usage.InputTokens > 0 || event.Response.Usage.OutputTokens > 0 || event.Response.Usage.InputTokensDetails.CachedTokens > 0 {
 			result.Usage.InputTokens = event.Response.Usage.InputTokens
 			result.Usage.OutputTokens = event.Response.Usage.OutputTokens
+			result.CachedInputTokens = event.Response.Usage.InputTokensDetails.CachedTokens
 		}
 
 		switch event.Type {
@@ -268,6 +274,13 @@ func (c *Client) StreamFromAnthropic(
 	})
 	if err != nil {
 		return StreamResult{}, err
+	}
+	if result.Usage.InputTokens > 0 {
+		if result.CachedInputTokens <= 0 {
+			log.Printf("[cache] non-caching observed model=%s input_tokens=%d cached_tokens=%d", result.Model, result.Usage.InputTokens, result.CachedInputTokens)
+		} else {
+			log.Printf("[cache] cache-hit model=%s input_tokens=%d cached_tokens=%d", result.Model, result.Usage.InputTokens, result.CachedInputTokens)
+		}
 	}
 
 	return result, nil

@@ -20,7 +20,7 @@ type Server struct {
 func New(cfg config.Config) *Server {
 	return &Server{
 		cfg:    cfg,
-		client: openai.New(cfg.OpenAIBase, cfg.OpenAIResponsesPath, cfg.OpenAIAPIKey, cfg.DebugJSON, cfg.DebugJSONMaxLen, cfg.DebugJSONLPath, cfg.DefaultInstructions),
+		client: openai.New(cfg.OpenAIBase, cfg.OpenAIResponsesPath, cfg.OpenAIAPIKey, cfg.DebugJSON, cfg.DebugJSONMaxLen, cfg.DebugJSONLPath, cfg.DefaultInstructions, config.ResolveDefaultInstructions),
 	}
 }
 

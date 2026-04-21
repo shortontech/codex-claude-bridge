@@ -48,11 +48,22 @@ func toResponseInput(req anthropic.MessagesRequest) interface{} {
 
 	for _, m := range req.Messages {
 		textParts := make([]string, 0, len(m.Content))
+		isSystemRole := strings.EqualFold(strings.TrimSpace(m.Role), "system")
 		for _, c := range m.Content {
 			switch c.Type {
 			case "text":
-				if c.Text != "" {
-					textParts = append(textParts, c.Text)
+				cleaned := c.Text
+				if isSystemRole {
+					cleaned = sanitizeClaudeIdentity(cleaned)
+					if looksLikeClaudeHarnessSystem(cleaned) {
+						cleaned = stripClaudeHarnessInstructionLines(cleaned)
+					}
+					cleaned = normalizeInstructionText(cleaned)
+				}
+				cleaned = stripSystemReminderText(cleaned)
+				cleaned = stripTaskNotificationText(cleaned)
+				if cleaned != "" {
+					textParts = append(textParts, cleaned)
 				}
 			case "tool_result":
 				items = append(items, responseInputItem{
@@ -87,6 +98,30 @@ func toResponseInput(req anthropic.MessagesRequest) interface{} {
 		return ""
 	}
 	return items
+}
+
+func stripTaskNotificationText(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "<task-notification>") && strings.Contains(lower, "</task-notification>") {
+		return ""
+	}
+	return s
+}
+
+func stripSystemReminderText(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "<system-reminder>") && strings.Contains(lower, "</system-reminder>") {
+		return ""
+	}
+	return s
 }
 
 func toResponseTools(tools []anthropic.ToolDefinition) []responseTool {
