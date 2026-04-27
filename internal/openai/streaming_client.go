@@ -82,6 +82,9 @@ func (c *Client) StreamFromAnthropic(
 		Stream:       true,
 		Store:        false,
 	}
+	if len(body.Tools) > 0 {
+		body.ToolChoice = "required"
+	}
 
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -150,6 +153,7 @@ func (c *Client) StreamFromAnthropic(
 	startedTool := map[int]bool{}
 	nextSyntheticOutputIndex := -1
 	sawToolCall := false
+	sawDoneCall := false
 	var fullText strings.Builder
 
 	resolveOutputIndex := func(event openAIStreamEvent) int {
@@ -184,7 +188,11 @@ func (c *Client) StreamFromAnthropic(
 			return nil
 		}
 		startedTool[outputIndex] = true
-		sawToolCall = true
+		if item.Name == doneToolName {
+			sawDoneCall = true
+		} else {
+			sawToolCall = true
+		}
 		if onToolStart == nil {
 			return nil
 		}
@@ -352,6 +360,9 @@ func (c *Client) StreamFromAnthropic(
 	if err != nil {
 		c.debugMatrixJSON(requestID, "inbound.response", "error", true, []byte(fmt.Sprintf(`{"error":%q}`, err.Error())))
 		return StreamResult{}, err
+	}
+	if len(body.Tools) > 0 && !sawToolCall && !sawDoneCall {
+		return StreamResult{}, fmt.Errorf("tool protocol violation: expected function call or Done")
 	}
 	completedPayload, _ := json.Marshal(map[string]any{
 		"response_id":         result.ResponseID,

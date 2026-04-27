@@ -71,6 +71,7 @@ Notes:
 - The bridge default system prompt comes from `prompts/bridge_system_prompt.md` (or `BRIDGE_SYSTEM_PROMPT_FILE`).
 - To inject that default into Claude Code custom system prompts, include `__INJECT_PROMPT__` in `--system-prompt`; the bridge replaces the marker with the committed default prompt.
 - The bridge prunes and rewrites tool metadata using `config/tool_policy.yaml` (or `TOOL_POLICY_FILE`) before forwarding tools upstream.
+- For tool-enabled turns, the bridge exposes a synthetic `Done` tool for terminal user-facing output; guidance in the default prompt instructs agents to speak to users via `Done.message` and avoid no-op shell acknowledgements.
 - If `DEFAULT_INSTRUCTIONS` is empty and `CODEX_SYSTEM_PROMPT_URL` is set, the bridge revalidates prompt cache using HTTP `If-Modified-Since` based on the cache file `stat` mtime.
 - Prompt resolution runs per request (not only at startup), so upstream prompt changes are picked up during long-running server sessions.
 - If the upstream returns `304 Not Modified`, cached prompt content is used.

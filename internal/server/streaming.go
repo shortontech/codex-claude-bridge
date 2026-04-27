@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -26,9 +27,11 @@ type streamedModel struct {
 	Usage        anthropic.Usage          `json:"usage"`
 }
 
-func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, req anthropic.MessagesRequest, upstreamModel string) {
+func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, req anthropic.MessagesRequest, upstreamModel, requestID string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		s.matrixLog(requestID, "outbound.response", "error", true, map[string]any{"error": "streaming unsupported by response writer"})
+		s.logAnthropicResponseErrorFinal(requestID, req.Stream, http.StatusInternalServerError, "api_error", "streaming unsupported by response writer")
 		s.writeError(w, http.StatusInternalServerError, "api_error", "streaming unsupported by response writer")
 		return
 	}
@@ -55,23 +58,39 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 			},
 		},
 	}); err != nil {
+		s.matrixLog(requestID, "outbound.response", "error", true, map[string]any{"error": err.Error(), "phase": "message_start"})
+		s.logAnthropicResponseErrorFinal(requestID, req.Stream, http.StatusBadGateway, "api_error", err.Error())
 		return
 	}
+	s.matrixLog(requestID, "outbound.response", "started", true, map[string]any{"message_id": messageID, "model": req.Model})
 	flusher.Flush()
 
 	nextIndex := 0
 	pendingText := strings.Builder{}
 	sawToolUse := false
+	toolStartCount := 0
+	toolDoneCount := 0
 	toolBlockIndexByOutput := map[int]int{}
+	toolNameByOutput := map[int]string{}
+	toolIDByOutput := map[int]string{}
+	toolArgsByOutput := map[int]string{}
+	doneByOutput := map[int]bool{}
 
-	result, err := s.client.StreamFromAnthropic(r.Context(), req, upstreamModel, func(delta string) error {
+	result, err := s.client.StreamFromAnthropic(r.Context(), req, upstreamModel, requestID, func(delta string) error {
 		if delta == "" {
 			return nil
 		}
 		pendingText.WriteString(delta)
 		return nil
 	}, func(outputIndex int, callID, name string) error {
+		toolNameByOutput[outputIndex] = name
+		toolIDByOutput[outputIndex] = callID
+		if strings.EqualFold(name, "Done") {
+			doneByOutput[outputIndex] = true
+			return nil
+		}
 		sawToolUse = true
+		toolStartCount++
 		pendingText.Reset()
 		idx := nextIndex
 		toolBlockIndexByOutput[outputIndex] = idx
@@ -94,8 +113,13 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 		if partialJSON == "" {
 			return nil
 		}
+		toolArgsByOutput[outputIndex] += partialJSON
+		if doneByOutput[outputIndex] {
+			return nil
+		}
 		idx, ok := toolBlockIndexByOutput[outputIndex]
 		if !ok {
+			s.matrixLog(requestID, "outbound.response", "drop", true, map[string]any{"reason": "missing_tool_block_index_args", "output_index": outputIndex})
 			return nil
 		}
 		if err := writeSSEEvent(w, "content_block_delta", map[string]any{
@@ -111,8 +135,13 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 		flusher.Flush()
 		return nil
 	}, func(outputIndex int) error {
+		if doneByOutput[outputIndex] {
+			return nil
+		}
+		toolDoneCount++
 		idx, ok := toolBlockIndexByOutput[outputIndex]
 		if !ok {
+			s.matrixLog(requestID, "outbound.response", "drop", true, map[string]any{"reason": "missing_tool_block_index", "output_index": outputIndex})
 			return nil
 		}
 		if err := writeSSEEvent(w, "content_block_stop", map[string]any{
@@ -125,6 +154,8 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 		return nil
 	})
 	if err != nil {
+		s.matrixLog(requestID, "outbound.response", "error", true, map[string]any{"error": err.Error(), "phase": "stream_from_upstream"})
+		s.logAnthropicResponseErrorFinal(requestID, req.Stream, http.StatusBadGateway, "api_error", err.Error())
 		_ = writeSSEEvent(w, "message_delta", map[string]any{
 			"type": "message_delta",
 			"delta": map[string]any{
@@ -142,7 +173,15 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 
-	if !sawToolUse && pendingText.Len() > 0 {
+	doneMessage := extractDoneMessage(toolNameByOutput, toolArgsByOutput)
+	if len(doneByOutput) > 0 && strings.TrimSpace(doneMessage) == "" {
+		doneMessage = "Completed."
+	}
+	visibleText := strings.TrimSpace(doneMessage)
+	if visibleText == "" {
+		visibleText = pendingText.String()
+	}
+	if !sawToolUse && strings.TrimSpace(visibleText) != "" {
 		textBlockIndex := nextIndex
 		nextIndex++
 		if err := writeSSEEvent(w, "content_block_start", map[string]any{
@@ -161,7 +200,7 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 			"index": textBlockIndex,
 			"delta": map[string]any{
 				"type": "text_delta",
-				"text": pendingText.String(),
+				"text": visibleText,
 			},
 		}); err != nil {
 			return
@@ -175,6 +214,53 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 		}
 		flusher.Flush()
 	}
+
+	finalContent := make([]anthropic.ContentBlock, 0, len(toolNameByOutput)+1)
+	if sawToolUse {
+		order := make([]int, 0, len(toolNameByOutput))
+		for outputIndex := range toolNameByOutput {
+			if doneByOutput[outputIndex] {
+				continue
+			}
+			order = append(order, outputIndex)
+		}
+		sort.Ints(order)
+		for _, outputIndex := range order {
+			finalContent = append(finalContent, anthropic.ContentBlock{
+				Type:  "tool_use",
+				ID:    toolIDByOutput[outputIndex],
+				Name:  toolNameByOutput[outputIndex],
+				Input: parseToolInputJSON(toolArgsByOutput[outputIndex]),
+			})
+		}
+	} else if strings.TrimSpace(doneMessage) != "" {
+		finalContent = append(finalContent, anthropic.ContentBlock{Type: "text", Text: doneMessage})
+	} else if pendingText.Len() > 0 {
+		finalContent = append(finalContent, anthropic.ContentBlock{Type: "text", Text: pendingText.String()})
+	}
+	s.logAnthropicResponseFinal(requestID, req.Stream, anthropic.MessagesResponse{
+		ID:         result.ResponseID,
+		Type:       "message",
+		Role:       "assistant",
+		Model:      req.Model,
+		Content:    finalContent,
+		StopReason: result.StopReason,
+		Usage:      result.Usage,
+	}, map[string]any{
+		"tool_starts":    toolStartCount,
+		"tool_completes": toolDoneCount,
+		"done_calls":     len(doneByOutput),
+		"done_message":   strings.TrimSpace(doneMessage) != "",
+	})
+
+	s.matrixLog(requestID, "outbound.response", "completed", true, map[string]any{
+		"stop_reason":    result.StopReason,
+		"input_tokens":   result.Usage.InputTokens,
+		"output_tokens":  result.Usage.OutputTokens,
+		"text_bytes":     pendingText.Len(),
+		"tool_starts":    toolStartCount,
+		"tool_completes": toolDoneCount,
+	})
 
 	if err := writeSSEEvent(w, "message_delta", map[string]any{
 		"type": "message_delta",
@@ -198,6 +284,47 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	flusher.Flush()
+}
+
+func parseToolInputJSON(s string) json.RawMessage {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return json.RawMessage(`{}`)
+	}
+	if json.Valid([]byte(trimmed)) {
+		return json.RawMessage(trimmed)
+	}
+	b, _ := json.Marshal(map[string]any{"_raw": trimmed})
+	return json.RawMessage(b)
+}
+
+func extractDoneMessage(toolNameByOutput map[int]string, toolArgsByOutput map[int]string) string {
+	indices := make([]int, 0, len(toolNameByOutput))
+	for idx, name := range toolNameByOutput {
+		if strings.EqualFold(name, "Done") {
+			indices = append(indices, idx)
+		}
+	}
+	if len(indices) == 0 {
+		return ""
+	}
+	sort.Ints(indices)
+	for i := len(indices) - 1; i >= 0; i-- {
+		idx := indices[i]
+		raw := strings.TrimSpace(toolArgsByOutput[idx])
+		if raw == "" {
+			continue
+		}
+		var args struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(raw), &args); err == nil {
+			if msg := strings.TrimSpace(args.Message); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
 }
 
 func writeSSEEvent(w http.ResponseWriter, event string, v any) error {
