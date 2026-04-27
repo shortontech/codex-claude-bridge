@@ -9,47 +9,52 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/shortontech/codex-claude-bridge/internal/anthropic"
-	"github.com/shortontech/codex-claude-bridge/internal/debuglog"
+	"github.com/shortontech/codex-claude-bridge/internal/toolpolicy"
 )
 
 type Client struct {
-	baseURL         string
-	responsesPath   string
-	apiKey          string
-	debugJSON       bool
-	debugMaxLen     int
-	debugJSONL      string
-	defaultInstr    string
-	instrResolver   func() string
-	http            *http.Client
-	sessionMu       sync.RWMutex
-	sessionCtx      map[string]string
-	projectDirByCCH map[string]string
-	lastProjectDir  string
+	baseURL       string
+	responsesPath string
+	apiKey        string
+	debugJSON     bool
+	debugMaxLen   int
+	debugJSONL    string
+	defaultInstr  string
+	instrResolver func() string
+	http          *http.Client
+	followUp      *followUpStore
+	toolPolicy    toolpolicy.Policy
 }
 
-const localContextHeader = "# Local bridge context"
 const customBridgeBaseInstructions = `You are ChatGPT, running as a coding assistant in a CLI harness.
 
 Be concise, accurate, and execution-oriented.
 - Prefer calling tools directly for actions that require filesystem, git, or shell access.
 - Report concrete results from tool output; do not claim success without evidence.
 - Preserve user intent and project conventions.
-- Avoid unnecessary verbosity and avoid identity confusion with other assistants.`
+- Avoid unnecessary verbosity and avoid identity confusion with other assistants.
 
-var cchRegex = regexp.MustCompile(`\bcch=([A-Za-z0-9_-]+)\b`)
-var claudeRepoRegex = regexp.MustCompile(`(?i)https?://github\.com/anthropics/claude-code`)
-var autoMemoryHeaderRegex = regexp.MustCompile(`(?im)^\s*#{1,6}\s*auto\s+memory\b`)
+# Tool use addendum
+- When tools are available and the user asks to continue, proceed, or run work, perform the required tool call(s) in the same turn instead of replying with intent-only text.
+- Do not stop on acknowledgement text such as "Got it" or "I’ll do that" when a tool call is still pending.
+- When the user asks for concrete repo/runtime results and tools are available, execute the measurement or command now and report results; do not ask for permission to run.`
+
+const injectPromptMarker = "__INJECT_PROMPT__"
+
+const executionRetryInstructions = `# Execution retry
+- The prior reply was intent-only.
+- Execute the required tool call(s) in this turn and report concrete results from tool output.
+- Do not ask for permission or defer execution.`
+
 var primaryWorkingDirRegex = regexp.MustCompile(`(?im)^\s*(?:-\s*)?Primary working directory:\s*(.+?)\s*$`)
 
-func New(baseURL, responsesPath, apiKey string, debugJSON bool, debugMaxLen int, debugJSONLPath, defaultInstructions string, instrResolver func() string) *Client {
+func New(baseURL, responsesPath, apiKey string, debugJSON bool, debugMaxLen int, debugJSONLPath, defaultInstructions string, instrResolver func() string, policy toolpolicy.Policy) *Client {
 	path := strings.TrimSpace(responsesPath)
 	if path == "" {
 		path = "/v1/responses"
@@ -58,16 +63,16 @@ func New(baseURL, responsesPath, apiKey string, debugJSON bool, debugMaxLen int,
 		path = "/" + path
 	}
 	return &Client{
-		baseURL:         strings.TrimRight(baseURL, "/"),
-		responsesPath:   path,
-		apiKey:          apiKey,
-		debugJSON:       debugJSON,
-		debugMaxLen:     debugMaxLen,
-		debugJSONL:      strings.TrimSpace(debugJSONLPath),
-		defaultInstr:    defaultInstructions,
-		instrResolver:   instrResolver,
-		sessionCtx:      make(map[string]string),
-		projectDirByCCH: make(map[string]string),
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		responsesPath: path,
+		apiKey:        apiKey,
+		debugJSON:     debugJSON,
+		debugMaxLen:   debugMaxLen,
+		debugJSONL:    strings.TrimSpace(debugJSONLPath),
+		defaultInstr:  defaultInstructions,
+		instrResolver: instrResolver,
+		followUp:      newFollowUpStore(),
+		toolPolicy:    policy,
 		http: &http.Client{
 			Timeout: 120 * time.Second,
 		},
@@ -79,6 +84,7 @@ type responseRequest struct {
 	Input        interface{}    `json:"input"`
 	Instructions string         `json:"instructions,omitempty"`
 	Tools        []responseTool `json:"tools,omitempty"`
+	ToolChoice   string         `json:"tool_choice,omitempty"`
 	Store        bool           `json:"store"`
 }
 
@@ -101,41 +107,122 @@ type apiError struct {
 	} `json:"error"`
 }
 
-func (c *Client) CreateFromAnthropic(ctx context.Context, req anthropic.MessagesRequest, model string) (anthropic.MessagesResponse, error) {
+func (c *Client) CreateFromAnthropic(ctx context.Context, req anthropic.MessagesRequest, model, requestID string) (anthropic.MessagesResponse, error) {
 	if req.Stream {
 		return anthropic.MessagesResponse{}, fmt.Errorf("stream=true not implemented in scaffold")
 	}
+	return c.createFromAnthropicViaStream(ctx, req, model, requestID)
+}
 
-	body := responseRequest{
-		Model:        model,
-		Input:        toResponseInput(req),
-		Instructions: c.resolveInstructions(req),
-		Tools:        toResponseTools(req.Tools),
-		Store:        false,
+func shouldFallbackToStreaming(err error) bool {
+	if err == nil {
+		return false
 	}
-	b, err := json.Marshal(body)
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "stream must be set to true")
+}
+
+func (c *Client) createFromAnthropicViaStream(ctx context.Context, req anthropic.MessagesRequest, model, requestID string) (anthropic.MessagesResponse, error) {
+	type pendingTool struct {
+		callID string
+		name   string
+		args   strings.Builder
+	}
+	text := strings.Builder{}
+	tools := map[int]*pendingTool{}
+
+	result, err := c.StreamFromAnthropic(ctx, req, model, requestID,
+		func(delta string) error {
+			text.WriteString(delta)
+			return nil
+		},
+		func(outputIndex int, callID, name string) error {
+			tools[outputIndex] = &pendingTool{callID: callID, name: name}
+			return nil
+		},
+		func(outputIndex int, partialJSON string) error {
+			if tool, ok := tools[outputIndex]; ok {
+				tool.args.WriteString(partialJSON)
+			}
+			return nil
+		},
+		func(outputIndex int) error {
+			return nil
+		},
+	)
 	if err != nil {
 		return anthropic.MessagesResponse{}, err
 	}
+
+	content := make([]anthropic.ContentBlock, 0, len(tools)+1)
+	if len(tools) > 0 {
+		indices := make([]int, 0, len(tools))
+		for idx := range tools {
+			indices = append(indices, idx)
+		}
+		sort.Ints(indices)
+		for _, idx := range indices {
+			tool := tools[idx]
+			content = append(content, anthropic.ContentBlock{
+				Type:  "tool_use",
+				ID:    tool.callID,
+				Name:  tool.name,
+				Input: parseJSONOrString(tool.args.String()),
+			})
+		}
+	} else {
+		content = append(content, anthropic.ContentBlock{Type: "text", Text: text.String()})
+	}
+
+	stopReason := result.StopReason
+	if stopReason == "" {
+		if len(tools) > 0 {
+			stopReason = "tool_use"
+		} else {
+			stopReason = "end_turn"
+		}
+	}
+
+	return anthropic.MessagesResponse{
+		ID:         result.ResponseID,
+		Type:       "message",
+		Role:       "assistant",
+		Model:      req.Model,
+		Content:    content,
+		StopReason: stopReason,
+		Usage: anthropic.Usage{
+			InputTokens:  result.Usage.InputTokens,
+			OutputTokens: result.Usage.OutputTokens,
+		},
+	}, nil
+}
+
+func (c *Client) callResponsesOnce(ctx context.Context, body responseRequest, stream bool, requestID string) (responseObject, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return responseObject{}, err
+	}
+	c.debugMatrixJSON(requestID, "outbound.request", "sent", stream, b)
 	c.debugLogJSON("upstream.request", b)
 
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.responsesPath, bytes.NewReader(b))
 	if err != nil {
-		return anthropic.MessagesResponse{}, err
+		return responseObject{}, err
 	}
 	hreq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	hreq.Header.Set("Content-Type", "application/json")
 
 	hresp, err := c.http.Do(hreq)
 	if err != nil {
-		return anthropic.MessagesResponse{}, err
+		return responseObject{}, err
 	}
 	defer hresp.Body.Close()
 
 	payload, err := io.ReadAll(hresp.Body)
 	if err != nil {
-		return anthropic.MessagesResponse{}, err
+		return responseObject{}, err
 	}
+	c.debugMatrixJSON(requestID, "inbound.response", "received", stream, payload)
 	c.debugLogJSON(fmt.Sprintf("upstream.response status=%d", hresp.StatusCode), payload)
 
 	if hresp.StatusCode >= 300 {
@@ -144,29 +231,43 @@ func (c *Client) CreateFromAnthropic(ctx context.Context, req anthropic.Messages
 		if e.Error.Message == "" {
 			e.Error.Message = string(payload)
 		}
-		return anthropic.MessagesResponse{}, fmt.Errorf("openai error (%d): %s", hresp.StatusCode, e.Error.Message)
+		return responseObject{}, fmt.Errorf("openai error (%d): %s", hresp.StatusCode, e.Error.Message)
 	}
 
 	var o responseObject
 	if err := json.Unmarshal(payload, &o); err != nil {
-		return anthropic.MessagesResponse{}, err
+		return responseObject{}, err
 	}
+	return o, nil
+}
 
-	content, stopReason := toAnthropicBlocks(o)
-	c.logCacheUsage(model, o.Usage.InputTokens, o.Usage.InputTokensDetails.CachedTokens)
+func (c *Client) debugMatrixJSON(requestID, edge, event string, stream bool, payload []byte) {
+	wrapped := map[string]any{
+		"request_id": requestID,
+		"edge":       edge,
+		"event":      event,
+		"stream":     stream,
+	}
+	if json.Valid(payload) {
+		wrapped["payload"] = json.RawMessage(payload)
+	} else {
+		wrapped["text"] = string(payload)
+	}
+	b, err := json.Marshal(wrapped)
+	if err != nil {
+		return
+	}
+	c.debugLogJSON("matrix", b)
+}
 
-	return anthropic.MessagesResponse{
-		ID:         o.ID,
-		Type:       "message",
-		Role:       "assistant",
-		Model:      req.Model,
-		Content:    content,
-		StopReason: stopReason,
-		Usage: anthropic.Usage{
-			InputTokens:  o.Usage.InputTokens,
-			OutputTokens: o.Usage.OutputTokens,
-		},
-	}, nil
+func (c *Client) debugToolChoiceDecision(requestID string, stream bool, decision toolChoiceDecision) {
+	payload, _ := json.Marshal(map[string]any{
+		"force":             decision.Force,
+		"reason":            decision.Reason,
+		"short_continue":    decision.ShortContinue,
+		"conversation_hash": decision.Conversation,
+	})
+	c.debugMatrixJSON(requestID, "policy", "tool_choice", stream, payload)
 }
 
 func (c *Client) logCacheUsage(model string, inputTokens, cachedTokens int) {
@@ -181,266 +282,34 @@ func (c *Client) logCacheUsage(model string, inputTokens, cachedTokens int) {
 }
 
 func (c *Client) resolveInstructions(req anthropic.MessagesRequest) string {
-	rawSystem := req.System.Text
-	parts := []string{customBridgeBaseInstructions}
-
-	if localCtx := c.getSessionLocalContext(rawSystem); localCtx != "" {
-		parts = append(parts, localCtx)
+	base := c.expandInjectedPrompt(req.System.Text)
+	if strings.TrimSpace(base) == "" {
+		base = strings.TrimSpace(c.defaultInstr)
 	}
-
-	sys := strings.TrimSpace(strings.Join(parts, "\n\n"))
-	sys = scrubClaudeHarnessMentions(sys)
-	sys = appendBridgeExecutionPolicy(normalizeInstructionText(sys), len(req.Tools) > 0)
-	return sys
+	if strings.TrimSpace(base) == "" {
+		projectDir := c.resolveProjectDir(req.System.Text)
+		base = composeBaseInstructions(projectDir)
+	}
+	return appendBridgeExecutionPolicy(base, len(req.Tools) > 0)
 }
 
-func scrubClaudeHarnessMentions(s string) string {
-	if s == "" {
-		return ""
-	}
-	out := s
-	out = claudeRepoRegex.ReplaceAllString(out, "https://github.com/openai/codex")
-	out = strings.ReplaceAll(out, "anthropics/claude-code", "openai/codex")
-	out = strings.ReplaceAll(out, "Anthropic's official CLI for Claude", "a terminal coding harness")
-	out = strings.ReplaceAll(out, "You are Claude Code", "You are ChatGPT")
-	out = strings.ReplaceAll(out, "Claude Code", "ChatGPT CLI")
-	return out
-}
-
-func looksLikeClaudeHarnessSystem(s string) bool {
-	if s == "" {
-		return false
-	}
-	lower := strings.ToLower(s)
-	return strings.Contains(lower, "x-anthropic-billing-header:") ||
-		strings.Contains(lower, "you are claude code, anthropic's official cli for claude.") ||
-		strings.Contains(lower, "generate a concise, sentence-case title")
-}
-
-func stripClaudeHarnessInstructionLines(s string) string {
-	if s == "" {
-		return ""
-	}
-	lines := strings.Split(s, "\n")
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		lower := strings.ToLower(trimmed)
-		if strings.HasPrefix(lower, "x-anthropic-billing-header:") {
-			continue
-		}
-		if lower == "you are claude code, anthropic's official cli for claude." {
-			continue
-		}
-		if strings.Contains(lower, "generate a concise, sentence-case title") ||
-			strings.Contains(lower, "return json with a single \"title\" field") ||
-			strings.HasPrefix(lower, "good examples:") ||
-			strings.HasPrefix(lower, "bad (too vague):") ||
-			strings.HasPrefix(lower, "bad (too long):") ||
-			strings.HasPrefix(lower, "bad (wrong case):") ||
-			strings.HasPrefix(trimmed, "{\"title\":") {
-			continue
-		}
-		out = append(out, line)
-	}
-	return strings.TrimSpace(strings.Join(out, "\n"))
-}
-
-func (c *Client) getSessionLocalContext(rawSystem string) string {
-	projectDir := c.resolveProjectDir(rawSystem)
-	sessionKey := extractSessionKey(rawSystem, projectDir)
-
-	c.sessionMu.RLock()
-	if cached, ok := c.sessionCtx[sessionKey]; ok {
-		c.sessionMu.RUnlock()
-		return cached
-	}
-	c.sessionMu.RUnlock()
-
-	built := buildLocalContextFromFiles(projectDir)
-
-	c.sessionMu.Lock()
-	if cached, ok := c.sessionCtx[sessionKey]; ok {
-		c.sessionMu.Unlock()
-		return cached
-	}
-	c.sessionCtx[sessionKey] = built
-	c.sessionMu.Unlock()
-	if built != "" {
-		log.Printf("[instructions] loaded local context for session=%s", sessionKey)
-	}
-	return built
-}
-
-func extractSessionKey(rawSystem, projectDir string) string {
-	if strings.TrimSpace(projectDir) != "" {
-		return "project:" + projectDir
-	}
-	if m := cchRegex.FindStringSubmatch(rawSystem); len(m) == 2 {
-		return "cch:" + m[1]
-	}
-	return "default"
-}
-
-func extractCCH(rawSystem string) string {
-	m := cchRegex.FindStringSubmatch(rawSystem)
-	if len(m) != 2 {
-		return ""
-	}
-	return m[1]
-}
-
-func (c *Client) resolveProjectDir(rawSystem string) string {
-	projectDir := extractPrimaryWorkingDirectory(rawSystem)
-	cch := extractCCH(rawSystem)
-
-	if strings.TrimSpace(projectDir) != "" {
-		c.sessionMu.Lock()
-		c.lastProjectDir = projectDir
-		if cch != "" {
-			c.projectDirByCCH[cch] = projectDir
-		}
-		c.sessionMu.Unlock()
-		return projectDir
-	}
-
-	if cch != "" {
-		c.sessionMu.RLock()
-		cached := strings.TrimSpace(c.projectDirByCCH[cch])
-		c.sessionMu.RUnlock()
-		if cached != "" {
-			return cached
-		}
-	}
-
-	c.sessionMu.RLock()
-	sticky := strings.TrimSpace(c.lastProjectDir)
-	c.sessionMu.RUnlock()
-	if sticky != "" {
-		return sticky
-	}
-
-	if cwd, err := os.Getwd(); err == nil {
-		return strings.TrimSpace(cwd)
-	}
-
-	return ""
-}
-
-func extractPrimaryWorkingDirectory(rawSystem string) string {
-	m := primaryWorkingDirRegex.FindStringSubmatch(rawSystem)
-	if len(m) != 2 {
-		return ""
-	}
-	return strings.TrimSpace(m[1])
-}
-
-func buildLocalContextFromFiles(projectDir string) string {
-	home, _ := os.UserHomeDir()
-
-	sections := make([]string, 0, 2)
-	projectRoot := strings.TrimSpace(projectDir)
-	if projectRoot == "" {
-		if cwd, err := os.Getwd(); err == nil {
-			projectRoot = cwd
-		}
-	}
-	if projectRoot != "" {
-		projectClaudePath := filepath.Join(projectRoot, "CLAUDE.md")
-		if b, readErr := os.ReadFile(projectClaudePath); readErr == nil {
-			if content, mode := extractAutoMemoryTailOrFull(string(b)); content != "" {
-				sections = append(sections, fmt.Sprintf("## CLAUDE.md\n%s", content))
-				log.Printf("[instructions] loaded project CLAUDE.md mode=%s path=%s", mode, projectClaudePath)
-			}
-		}
-	}
-
-	if home != "" {
-		globalClaudePath := filepath.Join(home, ".claude", "CLAUDE.md")
-		if b, readErr := os.ReadFile(globalClaudePath); readErr == nil {
-			if content, mode := extractAutoMemoryTailOrFull(string(b)); content != "" {
-				sections = append(sections, fmt.Sprintf("## .claude/CLAUDE.md\n%s", content))
-				log.Printf("[instructions] loaded global CLAUDE.md mode=%s path=%s", mode, globalClaudePath)
-			}
-		}
-
-		if projectRoot != "" {
-			encodedProjectRoot := strings.ReplaceAll(projectRoot, "/", "-")
-			projectMemoryPath := filepath.Join(home, ".claude", "projects", encodedProjectRoot, "memory", "MEMORY.md")
-			if b, readErr := os.ReadFile(projectMemoryPath); readErr == nil {
-				if content, mode := extractAutoMemoryTailOrFull(string(b)); content != "" {
-					sections = append(sections, fmt.Sprintf("## .claude/projects/%s/memory/MEMORY.md\n%s", encodedProjectRoot, content))
-					log.Printf("[instructions] loaded project MEMORY.md mode=%s path=%s", mode, projectMemoryPath)
-				}
-			}
-		}
-	}
-
-	if len(sections) == 0 {
-		return ""
-	}
-	return localContextHeader + "\n" + strings.Join(sections, "\n\n")
-}
-
-func extractAutoMemoryTail(s string) string {
-	trimmed := strings.TrimSpace(s)
+func (c *Client) expandInjectedPrompt(systemText string) string {
+	trimmed := strings.TrimSpace(systemText)
 	if trimmed == "" {
 		return ""
 	}
-	idx := autoMemoryHeaderRegex.FindStringIndex(trimmed)
-	if idx == nil {
-		return ""
+	if !strings.Contains(trimmed, injectPromptMarker) {
+		return trimmed
 	}
-	return strings.TrimSpace(trimmed[idx[0]:])
+	return strings.ReplaceAll(trimmed, injectPromptMarker, strings.TrimSpace(c.defaultInstr))
 }
 
-func extractAutoMemoryTailOrFull(s string) (string, string) {
-	trimmed := strings.TrimSpace(s)
-	if trimmed == "" {
-		return "", "empty"
+func composeBaseInstructions(projectDir string) string {
+	base := strings.TrimSpace(customBridgeBaseInstructions)
+	if strings.TrimSpace(projectDir) == "" {
+		return base
 	}
-	idx := autoMemoryHeaderRegex.FindStringIndex(trimmed)
-	if idx == nil {
-		return trimmed, "full"
-	}
-	return strings.TrimSpace(trimmed[idx[0]:]), "auto-memory-tail"
-}
-
-func sanitizeClaudeIdentity(s string) string {
-	if s == "" {
-		return s
-	}
-	// Claude Code injects this identity string; rewrite it to avoid confusing identity claims.
-	s = strings.ReplaceAll(s, "You are Claude Code, Anthropic's official CLI for Claude.", "You are ChatGPT, running as a coding assistant in a CLI environment.")
-	return s
-}
-
-func normalizeInstructionText(s string) string {
-	if s == "" {
-		return ""
-	}
-	lines := strings.Split(s, "\n")
-	out := make([]string, 0, len(lines))
-	prevBlank := false
-	for _, line := range lines {
-		line = strings.TrimRight(line, " \t")
-		trimmed := strings.TrimSpace(line)
-		// This line changes every turn and hurts upstream prompt prefix stability.
-		if strings.HasPrefix(trimmed, "x-anthropic-billing-header:") {
-			continue
-		}
-		if trimmed == "" {
-			if prevBlank {
-				continue
-			}
-			prevBlank = true
-			out = append(out, "")
-			continue
-		}
-		prevBlank = false
-		out = append(out, line)
-	}
-	return strings.TrimSpace(strings.Join(out, "\n"))
+	return base + "\n\n# Environment\n- Primary working directory: " + projectDir
 }
 
 func appendBridgeExecutionPolicy(instructions string, hasTools bool) string {
@@ -460,17 +329,28 @@ func appendBridgeExecutionPolicy(instructions string, hasTools bool) string {
 	return strings.TrimSpace(instructions) + policy
 }
 
+func (c *Client) resolveProjectDir(rawSystem string) string {
+	projectDir := extractPrimaryWorkingDirectory(rawSystem)
+	if strings.TrimSpace(projectDir) != "" {
+		return projectDir
+	}
+
+	if cwd, err := os.Getwd(); err == nil {
+		return strings.TrimSpace(cwd)
+	}
+
+	return ""
+}
+
+func extractPrimaryWorkingDirectory(rawSystem string) string {
+	m := primaryWorkingDirRegex.FindStringSubmatch(rawSystem)
+	if len(m) != 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
 func (c *Client) debugLogJSON(prefix string, payload []byte) {
-	if !c.debugJSON && c.debugJSONL == "" {
-		return
-	}
-
-	if c.debugJSONL != "" {
-		if err := debuglog.AppendJSONL(c.debugJSONL, "openai", prefix, payload); err != nil {
-			log.Printf("[debug-json] jsonl_write_error path=%s err=%v", c.debugJSONL, err)
-		}
-	}
-
 	if !c.debugJSON {
 		return
 	}

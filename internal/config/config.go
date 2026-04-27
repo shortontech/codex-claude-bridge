@@ -12,10 +12,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/shortontech/codex-claude-bridge/internal/toolpolicy"
 )
 
 const (
 	defaultInstructionsFallback = "You are a helpful assistant."
+	defaultBridgePromptPath     = "prompts/bridge_system_prompt.md"
 	defaultPromptCachePath      = "codex_system_prompt.txt"
 	defaultPromptURL            = "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/prompt.md"
 	maxPromptBytes              = 512 * 1024
@@ -34,6 +37,7 @@ type Config struct {
 	DebugJSON           bool
 	DebugJSONMaxLen     int
 	DebugJSONLPath      string
+	ToolPolicy          toolpolicy.Policy
 }
 
 func Load() (Config, error) {
@@ -49,8 +53,13 @@ func Load() (Config, error) {
 		openAIResponsesPath = "/responses"
 	}
 	defaultModel := getenv("DEFAULT_CODEX_MODEL", "gpt-5.3-codex")
-	defaultHaikuModel := getenv("HAIKU_MODEL", "gpt-5.1-codex-mini")
+	defaultHaikuModel := getenv("HAIKU_MODEL", "gpt-5.3-codex-spark")
 	defaultInstructions := ResolveDefaultInstructions()
+	toolPolicyPath := strings.TrimSpace(getenv("TOOL_POLICY_FILE", "config/tool_policy.yaml"))
+	policy, err := toolpolicy.Load(toolPolicyPath)
+	if err != nil {
+		log.Printf("[tool-policy] %v", err)
+	}
 
 	cfg := Config{
 		Port:                getenv("PORT", "8083"),
@@ -65,6 +74,7 @@ func Load() (Config, error) {
 		DebugJSON:           strings.EqualFold(getenv("DEBUG_JSON", "false"), "true"),
 		DebugJSONMaxLen:     getenvInt("DEBUG_JSON_MAX_LEN", 0),
 		DebugJSONLPath:      strings.TrimSpace(os.Getenv("DEBUG_JSONL_PATH")),
+		ToolPolicy:          policy,
 	}
 
 	if cfg.OpenAIAPIKey == "" {
@@ -132,6 +142,18 @@ func expandHome(path string) (string, error) {
 func ResolveDefaultInstructions() string {
 	if manual := strings.TrimSpace(os.Getenv("DEFAULT_INSTRUCTIONS")); manual != "" {
 		return manual
+	}
+
+	promptPath := strings.TrimSpace(getenv("BRIDGE_SYSTEM_PROMPT_FILE", defaultBridgePromptPath))
+	if promptPath != "" {
+		expanded, err := expandHome(promptPath)
+		if err == nil {
+			if b, readErr := os.ReadFile(expanded); readErr == nil {
+				if trimmed := strings.TrimSpace(string(b)); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
 	}
 
 	promptURL := strings.TrimSpace(getenv("CODEX_SYSTEM_PROMPT_URL", defaultPromptURL))

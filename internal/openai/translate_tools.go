@@ -5,11 +5,13 @@ import (
 	"strings"
 
 	"github.com/shortontech/codex-claude-bridge/internal/anthropic"
+	"github.com/shortontech/codex-claude-bridge/internal/toolpolicy"
 )
 
 type responseTool struct {
 	Type       string          `json:"type"`
 	Name       string          `json:"name"`
+	Description string         `json:"description,omitempty"`
 	Parameters json.RawMessage `json:"parameters"`
 }
 
@@ -48,22 +50,11 @@ func toResponseInput(req anthropic.MessagesRequest) interface{} {
 
 	for _, m := range req.Messages {
 		textParts := make([]string, 0, len(m.Content))
-		isSystemRole := strings.EqualFold(strings.TrimSpace(m.Role), "system")
 		for _, c := range m.Content {
 			switch c.Type {
 			case "text":
-				cleaned := c.Text
-				if isSystemRole {
-					cleaned = sanitizeClaudeIdentity(cleaned)
-					if looksLikeClaudeHarnessSystem(cleaned) {
-						cleaned = stripClaudeHarnessInstructionLines(cleaned)
-					}
-					cleaned = normalizeInstructionText(cleaned)
-				}
-				cleaned = stripSystemReminderText(cleaned)
-				cleaned = stripTaskNotificationText(cleaned)
-				if cleaned != "" {
-					textParts = append(textParts, cleaned)
+				if c.Text != "" {
+					textParts = append(textParts, c.Text)
 				}
 			case "tool_result":
 				items = append(items, responseInputItem{
@@ -99,41 +90,20 @@ func toResponseInput(req anthropic.MessagesRequest) interface{} {
 	}
 	return items
 }
-
-func stripTaskNotificationText(s string) string {
-	trimmed := strings.TrimSpace(s)
-	if trimmed == "" {
-		return ""
-	}
-	lower := strings.ToLower(trimmed)
-	if strings.Contains(lower, "<task-notification>") && strings.Contains(lower, "</task-notification>") {
-		return ""
-	}
-	return s
-}
-
-func stripSystemReminderText(s string) string {
-	trimmed := strings.TrimSpace(s)
-	if trimmed == "" {
-		return ""
-	}
-	lower := strings.ToLower(trimmed)
-	if strings.Contains(lower, "<system-reminder>") && strings.Contains(lower, "</system-reminder>") {
-		return ""
-	}
-	return s
-}
-
-func toResponseTools(tools []anthropic.ToolDefinition) []responseTool {
+func toResponseTools(tools []anthropic.ToolDefinition, policy toolpolicy.Policy) []responseTool {
 	if len(tools) == 0 {
 		return nil
 	}
 
 	out := make([]responseTool, 0, len(tools))
 	for _, t := range tools {
+		if !policy.IsEnabled(t.Name) {
+			continue
+		}
 		out = append(out, responseTool{
 			Type:       "function",
 			Name:       t.Name,
+			Description: policy.Description(t.Name, t.Description),
 			Parameters: normalizeToolSchema(t.Name, t.InputSchema),
 		})
 	}

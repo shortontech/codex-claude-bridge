@@ -13,17 +13,20 @@ type TextBlock struct {
 
 type ToolDefinition struct {
 	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"input_schema"`
 }
 
 func (t *ToolDefinition) UnmarshalJSON(data []byte) error {
 	var direct struct {
 		Name        string          `json:"name"`
+		Description string          `json:"description"`
 		InputSchema json.RawMessage `json:"input_schema"`
 		Parameters  json.RawMessage `json:"parameters"`
 	}
 	if err := json.Unmarshal(data, &direct); err == nil {
 		t.Name = strings.TrimSpace(direct.Name)
+		t.Description = strings.TrimSpace(direct.Description)
 		switch {
 		case len(direct.InputSchema) > 0:
 			t.InputSchema = direct.InputSchema
@@ -39,11 +42,13 @@ func (t *ToolDefinition) UnmarshalJSON(data []byte) error {
 		Type     string `json:"type"`
 		Function struct {
 			Name       string          `json:"name"`
+			Description string         `json:"description"`
 			Parameters json.RawMessage `json:"parameters"`
 		} `json:"function"`
 	}
 	if err := json.Unmarshal(data, &wrapped); err == nil && wrapped.Type == "function" {
 		t.Name = strings.TrimSpace(wrapped.Function.Name)
+		t.Description = strings.TrimSpace(wrapped.Function.Description)
 		t.InputSchema = wrapped.Function.Parameters
 		if t.Name != "" {
 			return nil

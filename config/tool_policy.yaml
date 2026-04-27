@@ -1,0 +1,35 @@
+enabled_tools:
+  - Agent
+  - Bash
+  - Edit
+  - LSP
+  - Read
+  - Skill
+  - TaskCreate
+  - TaskGet
+  - TaskList
+  - TaskOutput
+  - TaskStop
+  - WebFetch
+  - WebSearch
+  - Write
+  - mcp__go-edit__ReadGo
+  - mcp__go-edit__UpdateGo
+
+descriptions:
+  Agent: "Run a delegated sub-agent task."
+  Bash: "Run shell commands in the workspace."
+  Edit: "Replace exact text in a file."
+  LSP: "Run language-server IDE actions."
+  Read: "Read file or directory contents."
+  Skill: "Load a predefined workflow skill."
+  TaskCreate: "Create a background task."
+  TaskGet: "Get background task details."
+  TaskList: "List background tasks."
+  TaskOutput: "Read task output logs."
+  TaskStop: "Stop a running background task."
+  WebFetch: "Fetch and parse web page content."
+  WebSearch: "Search the web for sources."
+  Write: "Write file content at a path."
+  mcp__go-edit__ReadGo: "Read Go symbols and code."
+  mcp__go-edit__UpdateGo: "Apply structured Go code edits."
