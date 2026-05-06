@@ -155,28 +155,6 @@ func (c *Client) createFromAnthropicViaStream(ctx context.Context, req anthropic
 	}
 
 	content := make([]anthropic.ContentBlock, 0, len(tools)+1)
-	doneMessage := ""
-	hadDone := false
-	for _, tool := range tools {
-		if strings.EqualFold(tool.name, doneToolName) {
-			hadDone = true
-			raw := strings.TrimSpace(tool.args.String())
-			if raw == "" {
-				continue
-			}
-			var args struct {
-				Message string `json:"message"`
-			}
-			if err := json.Unmarshal([]byte(raw), &args); err == nil {
-				if msg := strings.TrimSpace(args.Message); msg != "" {
-					doneMessage = msg
-				}
-			}
-		}
-	}
-	if hadDone && strings.TrimSpace(doneMessage) == "" {
-		doneMessage = "Completed."
-	}
 	if len(tools) > 0 {
 		indices := make([]int, 0, len(tools))
 		for idx := range tools {
@@ -185,9 +163,6 @@ func (c *Client) createFromAnthropicViaStream(ctx context.Context, req anthropic
 		sort.Ints(indices)
 		for _, idx := range indices {
 			tool := tools[idx]
-			if strings.EqualFold(tool.name, doneToolName) {
-				continue
-			}
 			content = append(content, anthropic.ContentBlock{
 				Type:  "tool_use",
 				ID:    tool.callID,
@@ -195,9 +170,6 @@ func (c *Client) createFromAnthropicViaStream(ctx context.Context, req anthropic
 				Input: parseJSONOrString(tool.args.String()),
 			})
 		}
-	}
-	if len(content) == 0 && doneMessage != "" {
-		content = append(content, anthropic.ContentBlock{Type: "text", Text: doneMessage})
 	}
 	if len(content) == 0 {
 		content = append(content, anthropic.ContentBlock{Type: "text", Text: text.String()})

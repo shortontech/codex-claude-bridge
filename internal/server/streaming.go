@@ -74,7 +74,6 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 	toolNameByOutput := map[int]string{}
 	toolIDByOutput := map[int]string{}
 	toolArgsByOutput := map[int]string{}
-	doneByOutput := map[int]bool{}
 
 	result, err := s.client.StreamFromAnthropic(r.Context(), req, upstreamModel, requestID, func(delta string) error {
 		if delta == "" {
@@ -85,10 +84,6 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 	}, func(outputIndex int, callID, name string) error {
 		toolNameByOutput[outputIndex] = name
 		toolIDByOutput[outputIndex] = callID
-		if strings.EqualFold(name, "Done") {
-			doneByOutput[outputIndex] = true
-			return nil
-		}
 		sawToolUse = true
 		toolStartCount++
 		pendingText.Reset()
@@ -114,9 +109,6 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 			return nil
 		}
 		toolArgsByOutput[outputIndex] += partialJSON
-		if doneByOutput[outputIndex] {
-			return nil
-		}
 		idx, ok := toolBlockIndexByOutput[outputIndex]
 		if !ok {
 			s.matrixLog(requestID, "outbound.response", "drop", true, map[string]any{"reason": "missing_tool_block_index_args", "output_index": outputIndex})
@@ -135,9 +127,6 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 		flusher.Flush()
 		return nil
 	}, func(outputIndex int) error {
-		if doneByOutput[outputIndex] {
-			return nil
-		}
 		toolDoneCount++
 		idx, ok := toolBlockIndexByOutput[outputIndex]
 		if !ok {
@@ -173,14 +162,7 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 
-	doneMessage := extractDoneMessage(toolNameByOutput, toolArgsByOutput)
-	if len(doneByOutput) > 0 && strings.TrimSpace(doneMessage) == "" {
-		doneMessage = "Completed."
-	}
-	visibleText := strings.TrimSpace(doneMessage)
-	if visibleText == "" {
-		visibleText = pendingText.String()
-	}
+	visibleText := pendingText.String()
 	if !sawToolUse && strings.TrimSpace(visibleText) != "" {
 		textBlockIndex := nextIndex
 		nextIndex++
@@ -219,9 +201,6 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 	if sawToolUse {
 		order := make([]int, 0, len(toolNameByOutput))
 		for outputIndex := range toolNameByOutput {
-			if doneByOutput[outputIndex] {
-				continue
-			}
 			order = append(order, outputIndex)
 		}
 		sort.Ints(order)
@@ -233,8 +212,6 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 				Input: parseToolInputJSON(toolArgsByOutput[outputIndex]),
 			})
 		}
-	} else if strings.TrimSpace(doneMessage) != "" {
-		finalContent = append(finalContent, anthropic.ContentBlock{Type: "text", Text: doneMessage})
 	} else if pendingText.Len() > 0 {
 		finalContent = append(finalContent, anthropic.ContentBlock{Type: "text", Text: pendingText.String()})
 	}
@@ -249,8 +226,6 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 	}, map[string]any{
 		"tool_starts":    toolStartCount,
 		"tool_completes": toolDoneCount,
-		"done_calls":     len(doneByOutput),
-		"done_message":   strings.TrimSpace(doneMessage) != "",
 	})
 
 	s.matrixLog(requestID, "outbound.response", "completed", true, map[string]any{
@@ -296,35 +271,6 @@ func parseToolInputJSON(s string) json.RawMessage {
 	}
 	b, _ := json.Marshal(map[string]any{"_raw": trimmed})
 	return json.RawMessage(b)
-}
-
-func extractDoneMessage(toolNameByOutput map[int]string, toolArgsByOutput map[int]string) string {
-	indices := make([]int, 0, len(toolNameByOutput))
-	for idx, name := range toolNameByOutput {
-		if strings.EqualFold(name, "Done") {
-			indices = append(indices, idx)
-		}
-	}
-	if len(indices) == 0 {
-		return ""
-	}
-	sort.Ints(indices)
-	for i := len(indices) - 1; i >= 0; i-- {
-		idx := indices[i]
-		raw := strings.TrimSpace(toolArgsByOutput[idx])
-		if raw == "" {
-			continue
-		}
-		var args struct {
-			Message string `json:"message"`
-		}
-		if err := json.Unmarshal([]byte(raw), &args); err == nil {
-			if msg := strings.TrimSpace(args.Message); msg != "" {
-				return msg
-			}
-		}
-	}
-	return ""
 }
 
 func writeSSEEvent(w http.ResponseWriter, event string, v any) error {

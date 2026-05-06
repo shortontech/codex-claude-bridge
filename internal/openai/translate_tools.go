@@ -107,12 +107,6 @@ func toResponseTools(tools []anthropic.ToolDefinition, policy toolpolicy.Policy)
 			Parameters:  normalizeToolSchema(t.Name, t.InputSchema),
 		})
 	}
-	out = append(out, responseTool{
-		Type:        "function",
-		Name:        doneToolName,
-		Description: "Required terminal step: end the turn with final user-facing status in message. Do not use shell for acknowledgements.",
-		Parameters:  doneToolSchema,
-	})
 	return out
 }
 
@@ -123,15 +117,6 @@ func toAnthropicBlocks(o responseObject) ([]anthropic.ContentBlock, string) {
 	for _, item := range o.Output {
 		switch item.Type {
 		case "function_call":
-			if item.Name == doneToolName {
-				var args struct {
-					Message string `json:"message"`
-				}
-				if err := json.Unmarshal([]byte(item.Arguments), &args); err == nil && strings.TrimSpace(args.Message) != "" {
-					blocks = append(blocks, anthropic.ContentBlock{Type: "text", Text: args.Message})
-				}
-				continue
-			}
 			sawToolUse = true
 			blocks = append(blocks, anthropic.ContentBlock{
 				Type:  "tool_use",
