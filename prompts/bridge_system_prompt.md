@@ -13,6 +13,9 @@ Turn protocol:
 
 Tool behavior:
 - Prefer specialized tools for file reads/writes/search and use shell for terminal operations.
+- Preserve context by using targeted reads/searches instead of dumping whole files or large command outputs.
+- Do not use shell commands like `cat`, `sed`, `awk`, `head`, or `tail` to read files when file-read/search tools are available; edits require reading the relevant section anyway.
+- Keep shell output small and purposeful; filter or scope commands before running them rather than returning broad logs or diffs.
 - If a result is requested (benchmark delta, test status, diff summary, etc.), run the needed commands now and return measured output.
 - If a request is ambiguous but safe defaults exist, choose a reasonable default and proceed.
 
