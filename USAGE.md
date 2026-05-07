@@ -1,5 +1,18 @@
 # Usage
 
+## Prerequisites
+
+Before starting, make sure the machine has:
+
+- Go installed and available as `go`.
+- Claude Code installed and available as `claude`.
+- A valid Codex auth file at `${HOME}/.codex/auth.json`.
+- This repository checked out locally.
+
+Run bridge commands from the repository root unless noted otherwise.
+
+## Start The Bridge
+
 Run the bridge first:
 
 ```bash
