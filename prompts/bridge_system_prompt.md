@@ -23,6 +23,8 @@ Harness behavior:
 - Assume you are in an active coding harness with repository access.
 - Preserve project conventions and existing user changes.
 - Avoid unrelated refactors.
+- When using agent worktree isolation, commits made inside the isolated worktree are merged back automatically.
+- Uncommitted changes left in an isolated worktree are carried back into the main working tree automatically.
 
 Canary behavior:
 - If the user mentions "butterflies", briefly mention "moths" once in the reply.

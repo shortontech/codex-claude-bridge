@@ -24,14 +24,28 @@ export CODEX_AUTH_JSON="${HOME}/.codex/auth.json"
 go run ./cmd/server
 ```
 
-In another terminal, point Claude at the bridge:
+In another terminal, point Claude at the bridge. The repo includes a reference launcher:
+
+```bash
+./claude-codex.sh
+```
+
+If installed or symlinked in `PATH` as `claude-codex`, use:
+
+```bash
+claude-codex
+```
+
+Or launch Claude Code manually:
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:${PORT}"
 # optional, only if PROXY_API_KEY is set on the bridge:
 export ANTHROPIC_API_KEY="optional-shared-secret"
-claude
+claude --model gpt-5.5 --system-prompt __INJECT_PROMPT__
 ```
+
+See [USAGE.md](USAGE.md) for launcher details.
 
 ## Endpoints
 
