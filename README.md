@@ -2,6 +2,8 @@
 
 Anthropic-compatible facade over ChatGPT Codex Responses, written in Go.
 
+> **Note for most users:** [Claude Code Router](https://github.com/musistudio/claude-code-router) may be the better fit for general use. This repository remains valuable for users with a Codex subscription because it reuses your existing Codex credentials and avoids requiring a separate login flow.
+
 ## Why this bridge exists
 
 Claude Code currently has the best background-task UX for this workflow:
