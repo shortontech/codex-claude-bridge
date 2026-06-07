@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -66,27 +65,86 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 	flusher.Flush()
 
 	nextIndex := 0
-	pendingText := strings.Builder{}
-	sawToolUse := false
+	textOpen := false
+	textBlockIndex := -1
+	currentText := strings.Builder{}
 	toolStartCount := 0
 	toolDoneCount := 0
 	toolBlockIndexByOutput := map[int]int{}
 	toolNameByOutput := map[int]string{}
 	toolIDByOutput := map[int]string{}
 	toolArgsByOutput := map[int]string{}
+	finalContent := []anthropic.ContentBlock{}
+
+	closeTextBlock := func() error {
+		if !textOpen {
+			return nil
+		}
+		if err := writeSSEEvent(w, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": textBlockIndex,
+		}); err != nil {
+			return err
+		}
+		if currentText.Len() > 0 {
+			finalContent = append(finalContent, anthropic.ContentBlock{Type: "text", Text: currentText.String()})
+		}
+		textOpen = false
+		textBlockIndex = -1
+		currentText.Reset()
+		flusher.Flush()
+		return nil
+	}
+
+	ensureTextBlock := func() error {
+		if textOpen {
+			return nil
+		}
+		idx := nextIndex
+		nextIndex++
+		textBlockIndex = idx
+		textOpen = true
+		if err := writeSSEEvent(w, "content_block_start", map[string]any{
+			"type":  "content_block_start",
+			"index": idx,
+			"content_block": map[string]any{
+				"type": "text",
+				"text": "",
+			},
+		}); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
 
 	result, err := s.client.StreamFromAnthropic(r.Context(), req, upstreamModel, requestID, func(delta string) error {
 		if delta == "" {
 			return nil
 		}
-		pendingText.WriteString(delta)
+		if err := ensureTextBlock(); err != nil {
+			return err
+		}
+		currentText.WriteString(delta)
+		if err := writeSSEEvent(w, "content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": textBlockIndex,
+			"delta": map[string]any{
+				"type": "text_delta",
+				"text": delta,
+			},
+		}); err != nil {
+			return err
+		}
+		flusher.Flush()
 		return nil
 	}, func(outputIndex int, callID, name string) error {
+		if err := closeTextBlock(); err != nil {
+			return err
+		}
 		toolNameByOutput[outputIndex] = name
 		toolIDByOutput[outputIndex] = callID
-		sawToolUse = true
 		toolStartCount++
-		pendingText.Reset()
 		idx := nextIndex
 		toolBlockIndexByOutput[outputIndex] = idx
 		nextIndex++
@@ -139,6 +197,12 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 		}); err != nil {
 			return err
 		}
+		finalContent = append(finalContent, anthropic.ContentBlock{
+			Type:  "tool_use",
+			ID:    toolIDByOutput[outputIndex],
+			Name:  toolNameByOutput[outputIndex],
+			Input: parseToolInputJSON(toolArgsByOutput[outputIndex]),
+		})
 		flusher.Flush()
 		return nil
 	})
@@ -157,63 +221,12 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 			},
 		})
 		_ = writeSSEEvent(w, "message_stop", map[string]any{"type": "message_stop"})
-		_ = writeSSEData(w, "[DONE]")
 		flusher.Flush()
 		return
 	}
 
-	visibleText := pendingText.String()
-	if !sawToolUse && strings.TrimSpace(visibleText) != "" {
-		textBlockIndex := nextIndex
-		nextIndex++
-		if err := writeSSEEvent(w, "content_block_start", map[string]any{
-			"type":  "content_block_start",
-			"index": textBlockIndex,
-			"content_block": map[string]any{
-				"type": "text",
-				"text": "",
-			},
-		}); err != nil {
-			return
-		}
-		flusher.Flush()
-		if err := writeSSEEvent(w, "content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": textBlockIndex,
-			"delta": map[string]any{
-				"type": "text_delta",
-				"text": visibleText,
-			},
-		}); err != nil {
-			return
-		}
-		flusher.Flush()
-		if err := writeSSEEvent(w, "content_block_stop", map[string]any{
-			"type":  "content_block_stop",
-			"index": textBlockIndex,
-		}); err != nil {
-			return
-		}
-		flusher.Flush()
-	}
-
-	finalContent := make([]anthropic.ContentBlock, 0, len(toolNameByOutput)+1)
-	if sawToolUse {
-		order := make([]int, 0, len(toolNameByOutput))
-		for outputIndex := range toolNameByOutput {
-			order = append(order, outputIndex)
-		}
-		sort.Ints(order)
-		for _, outputIndex := range order {
-			finalContent = append(finalContent, anthropic.ContentBlock{
-				Type:  "tool_use",
-				ID:    toolIDByOutput[outputIndex],
-				Name:  toolNameByOutput[outputIndex],
-				Input: parseToolInputJSON(toolArgsByOutput[outputIndex]),
-			})
-		}
-	} else if pendingText.Len() > 0 {
-		finalContent = append(finalContent, anthropic.ContentBlock{Type: "text", Text: pendingText.String()})
+	if err := closeTextBlock(); err != nil {
+		return
 	}
 	s.logAnthropicResponseFinal(requestID, req.Stream, anthropic.MessagesResponse{
 		ID:         result.ResponseID,
@@ -232,7 +245,7 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 		"stop_reason":    result.StopReason,
 		"input_tokens":   result.Usage.InputTokens,
 		"output_tokens":  result.Usage.OutputTokens,
-		"text_bytes":     pendingText.Len(),
+		"text_bytes":     totalTextBytes(finalContent),
 		"tool_starts":    toolStartCount,
 		"tool_completes": toolDoneCount,
 	})
@@ -255,10 +268,17 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request, re
 	if err := writeSSEEvent(w, "message_stop", map[string]any{"type": "message_stop"}); err != nil {
 		return
 	}
-	if err := writeSSEData(w, "[DONE]"); err != nil {
-		return
-	}
 	flusher.Flush()
+}
+
+func totalTextBytes(blocks []anthropic.ContentBlock) int {
+	total := 0
+	for _, block := range blocks {
+		if block.Type == "text" {
+			total += len(block.Text)
+		}
+	}
+	return total
 }
 
 func parseToolInputJSON(s string) json.RawMessage {
@@ -285,9 +305,4 @@ func writeSSEEvent(w http.ResponseWriter, event string, v any) error {
 		return err
 	}
 	return nil
-}
-
-func writeSSEData(w http.ResponseWriter, data string) error {
-	_, err := fmt.Fprintf(w, "data: %s\n\n", data)
-	return err
 }

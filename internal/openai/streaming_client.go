@@ -311,6 +311,8 @@ func (c *Client) StreamFromAnthropic(
 			}
 			completedTool[outputIndex] = true
 			return nil
+		case "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
+			return nil
 		case "response.completed":
 			for _, item := range event.Response.Output {
 				if item.Type != "function_call" {

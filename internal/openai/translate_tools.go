@@ -10,9 +10,9 @@ import (
 
 type responseTool struct {
 	Type        string          `json:"type"`
-	Name        string          `json:"name"`
+	Name        string          `json:"name,omitempty"`
 	Description string          `json:"description,omitempty"`
-	Parameters  json.RawMessage `json:"parameters"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 type responseInputItem struct {
@@ -100,6 +100,12 @@ func toResponseTools(tools []anthropic.ToolDefinition, policy toolpolicy.Policy)
 		if !policy.IsEnabled(t.Name) {
 			continue
 		}
+		if isHostedWebSearchTool(t.Name) {
+			out = append(out, responseTool{
+				Type: "web_search",
+			})
+			continue
+		}
 		out = append(out, responseTool{
 			Type:        "function",
 			Name:        t.Name,
@@ -108,6 +114,15 @@ func toResponseTools(tools []anthropic.ToolDefinition, policy toolpolicy.Policy)
 		})
 	}
 	return out
+}
+
+func isHostedWebSearchTool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "websearch", "web_search":
+		return true
+	default:
+		return false
+	}
 }
 
 func toAnthropicBlocks(o responseObject) ([]anthropic.ContentBlock, string) {
