@@ -34,6 +34,8 @@ type Config struct {
 	HaikuModel          string
 	ProxyAPIKey         string
 	CodexAuthPath       string
+	Debug               bool
+	DebugCachePath      string
 	DebugJSON           bool
 	DebugJSONMaxLen     int
 	DebugJSONLPath      string
@@ -71,6 +73,8 @@ func Load() (Config, error) {
 		HaikuModel:          defaultHaikuModel,
 		ProxyAPIKey:         os.Getenv("PROXY_API_KEY"),
 		CodexAuthPath:       codexAuthPath,
+		Debug:               strings.EqualFold(getenv("DEBUG", "false"), "true"),
+		DebugCachePath:      strings.TrimSpace(getenv("DEBUG_CACHE_PATH", filepath.Join(os.TempDir(), "bridge-cache-debug.jsonl"))),
 		DebugJSON:           strings.EqualFold(getenv("DEBUG_JSON", "false"), "true"),
 		DebugJSONMaxLen:     getenvInt("DEBUG_JSON_MAX_LEN", 0),
 		DebugJSONLPath:      strings.TrimSpace(os.Getenv("DEBUG_JSONL_PATH")),

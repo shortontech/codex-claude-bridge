@@ -77,6 +77,8 @@ See [USAGE.md](USAGE.md) for launcher details.
 - `OPENAI_BASE_URL` (default: `https://chatgpt.com/backend-api/codex`)
 - `OPENAI_RESPONSES_PATH` (default: `/responses`)
 - `PROXY_API_KEY` (optional)
+- `DEBUG` (default: `false`, enables compact cache diagnostics; accepts `true`/`TRUE`)
+- `DEBUG_CACHE_PATH` (default: `bridge-cache-debug.jsonl` in the OS temp directory)
 - `DEBUG_JSON` (default: `false`, enables stdout debug logs)
 - `DEBUG_JSON_MAX_LEN` (default: `0`, no truncation)
 - `DEBUG_JSONL_PATH` (optional, append structured JSONL logs)
@@ -92,11 +94,13 @@ Notes:
 - If the upstream returns `304 Not Modified`, cached prompt content is used.
 - If prompt fetch fails, the bridge falls back to cached prompt content (if present), then to `You are a helpful assistant.`.
 - The bridge forwards inbound message content without stripping harness-specific reminder/notification blocks.
+- The bridge strips volatile `x-anthropic-billing-header` system lines before forwarding instructions upstream, so per-request Claude Code metadata does not perturb upstream prompt caching.
 - Outbound instructions use the bridge base instructions plus `Primary working directory` when present in the inbound system context.
 - Matrix logs are emitted under `prefix="matrix"` with `request_id`, `edge`, and `event` to correlate the four request/response directions.
 - Matrix logs include explicit `rejected`/`drop` events for swallowed paths (guard failures, malformed upstream SSE events, unknown event types, and unmapped tool output indexes).
 - The bridge returns `x-request-id` on `/v1/messages` responses for end-to-end log correlation.
 - The bridge logs cache invariants to stderr as `[cache] ... cached_tokens=...` for both streaming and non-streaming responses.
+- If `DEBUG=true`, compact cache diagnostics are appended to `DEBUG_CACHE_PATH` with hashes and byte counts for upstream `instructions`, `tools`, and each `input` item, plus cached-token results. Raw prompt text is not written.
 - `DEBUG_JSONL_PATH` writes JSONL logs even when `DEBUG_JSON=false`.
 - No `response.json` file is written; JSONL is the only file-based debug log.
 
@@ -131,6 +135,9 @@ curl -sS http://localhost:8083/v1/messages \
 ## JSONL debug examples
 
 ```bash
+export DEBUG_CACHE_PATH="${TMPDIR:-/tmp}/bridge-cache-debug.jsonl"
+tail -f /tmp/bridge-cache-debug.jsonl | jq -c .
+tail -f /tmp/bridge-cache-debug.jsonl | jq -c 'select(.prefix=="cache.result") | .payload'
 tail -f /tmp/bridge-debug.jsonl | jq -c .
 tail -f /tmp/bridge-debug.jsonl | jq -c 'select(.prefix=="upstream.stream.event")'
 tail -f /tmp/bridge-debug.jsonl | jq -c 'select(.source=="openai") | .payload.type?'

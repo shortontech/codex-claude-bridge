@@ -87,6 +87,7 @@ func (c *Client) StreamFromAnthropic(
 	if err != nil {
 		return StreamResult{}, err
 	}
+	c.debugCacheRequest(requestID, true, body, payload)
 	if c.debugJSON {
 		type dbgTool struct {
 			Name        string `json:"name"`
@@ -371,6 +372,7 @@ func (c *Client) StreamFromAnthropic(
 			log.Printf("[cache] cache-hit model=%s input_tokens=%d cached_tokens=%d", result.Model, result.Usage.InputTokens, result.CachedInputTokens)
 		}
 	}
+	c.debugCacheResult(requestID, true, result)
 
 	return result, nil
 }

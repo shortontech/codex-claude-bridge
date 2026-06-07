@@ -19,17 +19,19 @@ import (
 )
 
 type Client struct {
-	baseURL       string
-	responsesPath string
-	apiKey        string
-	debugJSON     bool
-	debugMaxLen   int
-	debugJSONL    string
-	defaultInstr  string
-	instrResolver func() string
-	http          *http.Client
-	followUp      *followUpStore
-	toolPolicy    toolpolicy.Policy
+	baseURL        string
+	responsesPath  string
+	apiKey         string
+	debugCache     bool
+	debugCachePath string
+	debugJSON      bool
+	debugMaxLen    int
+	debugJSONL     string
+	defaultInstr   string
+	instrResolver  func() string
+	http           *http.Client
+	followUp       *followUpStore
+	toolPolicy     toolpolicy.Policy
 }
 
 const customBridgeBaseInstructions = `You are ChatGPT, running as a coding assistant in a CLI harness.
@@ -54,7 +56,7 @@ const executionRetryInstructions = `# Execution retry
 
 var primaryWorkingDirRegex = regexp.MustCompile(`(?im)^\s*(?:-\s*)?Primary working directory:\s*(.+?)\s*$`)
 
-func New(baseURL, responsesPath, apiKey string, debugJSON bool, debugMaxLen int, debugJSONLPath, defaultInstructions string, instrResolver func() string, policy toolpolicy.Policy) *Client {
+func New(baseURL, responsesPath, apiKey string, debugCache bool, debugCachePath string, debugJSON bool, debugMaxLen int, debugJSONLPath, defaultInstructions string, instrResolver func() string, policy toolpolicy.Policy) *Client {
 	path := strings.TrimSpace(responsesPath)
 	if path == "" {
 		path = "/v1/responses"
@@ -63,16 +65,18 @@ func New(baseURL, responsesPath, apiKey string, debugJSON bool, debugMaxLen int,
 		path = "/" + path
 	}
 	return &Client{
-		baseURL:       strings.TrimRight(baseURL, "/"),
-		responsesPath: path,
-		apiKey:        apiKey,
-		debugJSON:     debugJSON,
-		debugMaxLen:   debugMaxLen,
-		debugJSONL:    strings.TrimSpace(debugJSONLPath),
-		defaultInstr:  defaultInstructions,
-		instrResolver: instrResolver,
-		followUp:      newFollowUpStore(),
-		toolPolicy:    policy,
+		baseURL:        strings.TrimRight(baseURL, "/"),
+		responsesPath:  path,
+		apiKey:         apiKey,
+		debugCache:     debugCache,
+		debugCachePath: strings.TrimSpace(debugCachePath),
+		debugJSON:      debugJSON,
+		debugMaxLen:    debugMaxLen,
+		debugJSONL:     strings.TrimSpace(debugJSONLPath),
+		defaultInstr:   defaultInstructions,
+		instrResolver:  instrResolver,
+		followUp:       newFollowUpStore(),
+		toolPolicy:     policy,
 		http: &http.Client{
 			Timeout: 120 * time.Second,
 		},
@@ -90,6 +94,7 @@ type responseRequest struct {
 
 type responseObject struct {
 	ID         string               `json:"id"`
+	Model      string               `json:"model"`
 	OutputText string               `json:"output_text"`
 	Output     []responseOutputItem `json:"output"`
 	Usage      struct {
@@ -203,6 +208,7 @@ func (c *Client) callResponsesOnce(ctx context.Context, body responseRequest, st
 	if err != nil {
 		return responseObject{}, err
 	}
+	c.debugCacheRequest(requestID, stream, body, b)
 	c.debugMatrixJSON(requestID, "outbound.request", "sent", stream, b)
 	c.debugLogJSON("upstream.request", b)
 
@@ -239,6 +245,7 @@ func (c *Client) callResponsesOnce(ctx context.Context, body responseRequest, st
 	if err := json.Unmarshal(payload, &o); err != nil {
 		return responseObject{}, err
 	}
+	c.debugCacheResponseObject(requestID, stream, o)
 	return o, nil
 }
 
@@ -295,7 +302,7 @@ func (c *Client) resolveInstructions(req anthropic.MessagesRequest) string {
 }
 
 func (c *Client) expandInjectedPrompt(systemText string) string {
-	trimmed := strings.TrimSpace(systemText)
+	trimmed := strings.TrimSpace(stripAnthropicVolatileSystemLines(systemText))
 	if trimmed == "" {
 		return ""
 	}
@@ -303,6 +310,18 @@ func (c *Client) expandInjectedPrompt(systemText string) string {
 		return trimmed
 	}
 	return strings.ReplaceAll(trimmed, injectPromptMarker, strings.TrimSpace(c.defaultInstr))
+}
+
+func stripAnthropicVolatileSystemLines(systemText string) string {
+	lines := strings.Split(systemText, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "x-anthropic-billing-header:") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
 }
 
 func composeBaseInstructions(projectDir string) string {
